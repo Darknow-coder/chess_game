@@ -128,11 +128,24 @@ const SB={
   err:'',             // dernier message d'erreur à afficher
   configured(){return !!(window.SUPABASE_URL&&window.SUPABASE_ANON&&window.supabase);},
   init(){
-    if(!this.configured())return false;
-    try{this.client=window.supabase.createClient(window.SUPABASE_URL,window.SUPABASE_ANON);}
-    catch(e){console.warn('Supabase init',e);return false;}
+    // Évite de recréer plusieurs clients/listeners si une action relance l'initialisation.
+    if(this.client)return true;
+    if(!this.configured()){
+      this.err='Supabase n’est pas configuré : URL, clé publique ou SDK manquant.';
+      return false;
+    }
+    try{
+      this.client=window.supabase.createClient(window.SUPABASE_URL,window.SUPABASE_ANON);
+    }catch(e){
+      this.client=null;
+      this.err='Impossible d’initialiser Supabase : '+(e?.message||e);
+      console.error('Supabase init',e);
+      return false;
+    }
     // Restaure la session existante puis écoute les changements (connexion/déconnexion).
-    this.client.auth.getSession().then(({data})=>this._onSession(data?.session||null));
+    this.client.auth.getSession()
+      .then(({data})=>this._onSession(data?.session||null))
+      .catch(e=>console.error('Supabase getSession',e));
     this.client.auth.onAuthStateChange((_ev,session)=>this._onSession(session));
     return true;
   },
@@ -161,6 +174,12 @@ const SB={
     if(this.profile){this.profile.username=P.name;this.profile.avatar_idx=P.avI||0;}
   },
   async signUp(email,pass,username){
+    // Sécurité : si le client n'a pas été créé au chargement, on retente ici
+    // au lieu de provoquer une erreur "Cannot read properties of null (reading 'auth')".
+    if(!this.client&&!this.init()){
+      render();
+      return false;
+    }
     this.busy=true;this.err='';render();
     const {data,error}=await this.client.auth.signUp({email,password:pass,options:{data:{username}}});
     this.busy=false;
@@ -171,6 +190,11 @@ const SB={
     toast('✅','Compte créé','Bienvenue au Salon !');return true;
   },
   async signIn(email,pass){
+    // Même protection que pour l'inscription.
+    if(!this.client&&!this.init()){
+      render();
+      return false;
+    }
     this.busy=true;this.err='';render();
     const {error}=await this.client.auth.signInWithPassword({email,password:pass});
     this.busy=false;
