@@ -17,6 +17,15 @@
 <body>
 <div id="app"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<!-- SDK Supabase (frontend). Utilise UNIQUEMENT la clé publique "anon" — jamais la service_role. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<script>
+  // ⚠️ À remplir avec vos valeurs Supabase (Project Settings → API).
+  // SUPABASE_URL  : "https://xxxxxxxx.supabase.co"
+  // SUPABASE_ANON : la clé publique "anon" (frontend). Ne JAMAIS mettre la service_role ici.
+  window.SUPABASE_URL  = "akfvpmrclgiparwdftqn.supabase.co/rest/v1/";
+  window.SUPABASE_ANON = "sb_publishable_k1XLDJdRW_m0Tq84bWKlMw_Qy74G2IT";
+</script>
 <script src="script.js"></script>
 </body>
 </html>

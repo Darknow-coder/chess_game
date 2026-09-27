@@ -162,6 +162,16 @@ input:focus{outline:none;border-color:var(--gold)}
 .board-shell{display:flex;flex-direction:column;gap:6px}
 .subtle-divider{height:1px;background:rgba(255,255,255,.06);margin:10px 0}
 .inline-note{font-size:10px;color:var(--muted);line-height:1.5}
+.elo-pair{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.elo-box{min-width:0;padding:10px;border-radius:12px;background:var(--surface3);border:1px solid rgba(255,255,255,.08)}
+.elo-box.solo{border-color:rgba(212,175,55,.35)}
+.elo-box.world{border-color:rgba(74,222,128,.24)}
+.elo-head{display:flex;align-items:center;justify-content:space-between;gap:4px;font-size:9px;font-weight:700;letter-spacing:.6px;color:var(--muted)}
+.elo-tag{font-size:8px;padding:2px 5px;border-radius:99px;background:rgba(212,175,55,.12);color:var(--gold);white-space:nowrap}
+.elo-tag.offline{background:rgba(255,255,255,.07);color:var(--muted)}
+.elo-number{font-family:var(--font-mono);font-size:24px;line-height:1.1;font-weight:700;color:var(--text);margin-top:6px}
+.elo-box.solo .elo-number{color:var(--gold)}
+.elo-caption{font-size:9px;color:var(--muted);margin-top:3px}
 
 @media(min-width:640px){.brd{width:min(70vw,520px);height:min(70vw,520px)}.pg{padding:16px 20px}.hero-cta-stack{flex-direction:row}}
 @media(max-width:360px){html{font-size:14px}}

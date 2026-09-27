@@ -99,14 +99,135 @@ function vib(ms){try{navigator.vibrate(ms||8)}catch(e){}}
 // ── Persistance ─────────────────────────────────────────────
 function ld(k,d){try{const r=localStorage.getItem(k);return r?JSON.parse(r):d}catch(e){return d}}
 function sv(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
-let P=ld('er2_p',{name:'Maître du Salon',avI:0,tiI:0,bt:'bois',pt:0,coins:50,tc:50,elo:0,owned:['b0','a0','t0','pt0'],ach:[],trophies:[],st:{},lg:0,streak:0,bestS:0,hist:[],ld:null,bestPuzzleStreak:0,puzzleStreak:0,totalPuzzlesSolved:0,totalLessonsDone:0,bestElo:0,fastLaunches:0});
+let P=ld('er2_p',{name:'Maître du Salon',avI:0,tiI:0,bt:'bois',pt:0,coins:50,tc:50,elo:0,worldElo:1200,worldStats:{wins:0,losses:0,draws:0,games:0},owned:['b0','a0','t0','pt0'],ach:[],trophies:[],st:{},lg:0,streak:0,bestS:0,hist:[],ld:null,bestPuzzleStreak:0,puzzleStreak:0,totalPuzzlesSolved:0,totalLessonsDone:0,bestElo:0,fastLaunches:0});
 let PL=ld('er2_l',[]),PP=ld('er2_pp',[]),TE=ld('er2_te',1200),tutS=!!ld('er2_tut',false);
 if(!P.owned)P.owned=['b0','a0','t0','pt0'];
 ['b0','a0','t0','pt0'].forEach(x=>{if(!P.owned.includes(x))P.owned.push(x)});
 if(!P.trophies)P.trophies=[];
 if(P.elo===undefined)P.elo=0;
 if(P.pt===undefined)P.pt=0;
+// Migration non destructive : les anciennes sauvegardes gardent leur ELO Solo et leurs statistiques.
+if(typeof P.worldElo!=='number'||!Number.isFinite(P.worldElo))P.worldElo=1200;
+P.worldStats={wins:0,losses:0,draws:0,games:0,...(P.worldStats&&typeof P.worldStats==='object'&&!Array.isArray(P.worldStats)?P.worldStats:{})};
+['wins','losses','draws','games'].forEach(k=>{
+  if(typeof P.worldStats[k]!=='number'||!Number.isFinite(P.worldStats[k]))P.worldStats[k]=0;
+});
 function svA(){sv('er2_p',P);sv('er2_l',PL);sv('er2_pp',PP);sv('er2_te',TE);sv('er2_tut',tutS);}
+
+// ── Compte en ligne (Supabase — Étape 1 : Auth + Profil) ─────
+// Règles de cette étape :
+//  • Clé publique "anon" uniquement (jamais la service_role côté client).
+//  • Aucun matchmaking, aucune partie en ligne, aucun classement.
+//  • L'ELO Solo (P.elo) reste 100 % local et n'est jamais envoyé.
+//  • Le profil Supabase deviendra plus tard la source officielle de l'ELO mondial.
+const SB={
+  client:null,        // instance supabase-js
+  user:null,          // utilisateur connecté (auth.users)
+  profile:null,       // ligne de la table `profiles`
+  busy:false,         // opération réseau en cours
+  err:'',             // dernier message d'erreur à afficher
+  configured(){return !!(window.SUPABASE_URL&&window.SUPABASE_ANON&&window.supabase);},
+  init(){
+    if(!this.configured())return false;
+    try{this.client=window.supabase.createClient(window.SUPABASE_URL,window.SUPABASE_ANON);}
+    catch(e){console.warn('Supabase init',e);return false;}
+    // Restaure la session existante puis écoute les changements (connexion/déconnexion).
+    this.client.auth.getSession().then(({data})=>this._onSession(data?.session||null));
+    this.client.auth.onAuthStateChange((_ev,session)=>this._onSession(session));
+    return true;
+  },
+  async _onSession(session){
+    this.user=session?.user||null;
+    this.profile=null;
+    if(this.user){await this.ensureProfile();}
+    render();
+  },
+  // Crée le profil s'il n'existe pas encore, puis le charge.
+  async ensureProfile(){
+    if(!this.client||!this.user)return null;
+    const {data,error}=await this.client.from('profiles').select('*').eq('id',this.user.id).maybeSingle();
+    if(error){console.warn('profiles select',error);this.err=error.message;return null;}
+    if(data){this.profile=data;return data;}
+    const fresh={id:this.user.id,username:P.name||'Maître du Salon',avatar_idx:P.avI||0,world_elo:1200,world_wins:0,world_losses:0,world_draws:0,world_games:0};
+    const ins=await this.client.from('profiles').insert(fresh).select('*').maybeSingle();
+    if(ins.error){console.warn('profiles insert',ins.error);this.err=ins.error.message;return null;}
+    this.profile=ins.data||fresh;return this.profile;
+  },
+  // Synchronise pseudo + avatar local vers le profil en ligne (jamais l'ELO Solo).
+  async pushCosmetics(){
+    if(!this.client||!this.user)return;
+    const {error}=await this.client.from('profiles').update({username:P.name,avatar_idx:P.avI||0}).eq('id',this.user.id);
+    if(error){console.warn('profiles update',error);return;}
+    if(this.profile){this.profile.username=P.name;this.profile.avatar_idx=P.avI||0;}
+  },
+  async signUp(email,pass,username){
+    this.busy=true;this.err='';render();
+    const {data,error}=await this.client.auth.signUp({email,password:pass,options:{data:{username}}});
+    this.busy=false;
+    if(error){this.err=error.message;render();return false;}
+    if(username)P.name=username;svA();
+    // Si la confirmation e-mail est activée, la session est nulle jusqu'à validation.
+    if(!data.session){toast('📧','Vérifiez vos e-mails','Confirmez votre adresse pour activer le compte.');render();return true;}
+    toast('✅','Compte créé','Bienvenue au Salon !');return true;
+  },
+  async signIn(email,pass){
+    this.busy=true;this.err='';render();
+    const {error}=await this.client.auth.signInWithPassword({email,password:pass});
+    this.busy=false;
+    if(error){this.err=error.message;render();return false;}
+    toast('🔐','Connecté','Profil en ligne chargé.');return true;
+  },
+  async signOut(){
+    if(!this.client)return;
+    await this.client.auth.signOut();
+    this.user=null;this.profile=null;toast('👋','Déconnecté','À bientôt !');render();
+  },
+};
+
+// Bloc "Compte" affiché dans le Profil (design existant : cartes .cd, boutons .btn).
+function rAccount(){
+  if(!SB.configured())return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-r">Non configuré</span></div><div class="inline-note">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour activer la création de compte. L'ELO Solo et le Duel Local fonctionnent sans compte.</div></div>`;
+  if(SB.user){
+    const pr=SB.profile;
+    return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-n">Connecté</span></div>
+    <div class="xs tm">${SB.user.email||''}</div>
+    ${pr?`<div class="kpi-row mt2"><div class="kpi"><div class="v tg">${pr.world_elo}</div><div class="l">ELO mondial (profil)</div></div><div class="kpi"><div class="v">${pr.world_games}</div><div class="l">Parties classées</div></div><div class="kpi"><div class="v tgn">${pr.world_wins}</div><div class="l">Victoires</div></div></div>`:`<div class="inline-note mt2">Chargement du profil…</div>`}
+    <div class="inline-note mt2">Le classement mondial et les parties en ligne arrivent dans une prochaine étape. Votre ELO Solo reste local.</div>
+    <div class="g2 mt2"><button class="btn btn-d btn-s" onclick="SB.pushCosmetics().then(()=>toast('☁️','Profil synchronisé','Pseudo et avatar mis à jour.'))">☁️ Synchroniser pseudo/avatar</button><button class="btn btn-d btn-s" onclick="SB.signOut()">Se déconnecter</button></div></div>`;
+  }
+  return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-g">Hors ligne</span></div>
+  <div class="inline-note">Créez un compte pour préparer votre ELO mondial (1200 au départ). Vos données locales sont conservées.</div>
+  <div class="g2 mt2"><button class="btn btn-g btn-s" onclick="openAuth('in')">Se connecter</button><button class="btn btn-d btn-s" onclick="openAuth('up')">Créer un compte</button></div></div>`;
+}
+
+// Feuille d'authentification (email + mot de passe), réutilise .ov / .pr-b existants.
+function openAuth(mode){
+  const up=mode==='up';
+  const ov=document.createElement('div');ov.className='ov c';ov.id='auth-ov';
+  ov.innerHTML=`<div class="pr-b" style="padding:20px;max-width:360px;width:100%;text-align:left">
+    <h4 class="font-serif lg mb2" style="font-family:'Cormorant Garamond',serif">${up?'Créer un compte':'Se connecter'}</h4>
+    ${up?`<label class="xs tm">Pseudo</label><input type="text" id="au-name" value="${P.name}" maxlength="28" style="width:100%;margin:4px 0 8px">`:''}
+    <label class="xs tm">E-mail</label><input type="email" id="au-email" autocomplete="email" style="width:100%;margin:4px 0 8px">
+    <label class="xs tm">Mot de passe</label><input type="password" id="au-pass" autocomplete="${up?'new-password':'current-password'}" minlength="6" style="width:100%;margin:4px 0 8px">
+    <div id="au-err" class="xs tr" style="min-height:14px">${SB.err||''}</div>
+    <button class="btn btn-g btn-f mt2" id="au-go" onclick="submitAuth(${up})">${up?'Créer mon compte':'Connexion'}</button>
+    <button class="btn btn-d btn-f mt2" onclick="document.getElementById('auth-ov').remove()">Annuler</button>
+    <div class="inline-note mt2">${up?'6 caractères minimum. Un e-mail de confirmation peut être requis.':'Pas encore de compte ? <a href="#" onclick="document.getElementById(\'auth-ov\').remove();openAuth(\'up\');return false" style="color:var(--gold)">Créer un compte</a>'}</div>
+  </div>`;
+  ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
+  document.body.appendChild(ov);setTimeout(()=>document.getElementById(up?'au-name':'au-email')?.focus(),80);
+}
+async function submitAuth(up){
+  const email=(document.getElementById('au-email')?.value||'').trim();
+  const pass=document.getElementById('au-pass')?.value||'';
+  const name=(document.getElementById('au-name')?.value||'').trim();
+  const err=document.getElementById('au-err'),go=document.getElementById('au-go');
+  if(!email||pass.length<6){if(err)err.textContent='E-mail valide et mot de passe de 6 caractères minimum requis.';return;}
+  if(go){go.disabled=true;go.textContent='Patientez…';}
+  const ok=up?await SB.signUp(email,pass,name):await SB.signIn(email,pass);
+  if(ok){document.getElementById('auth-ov')?.remove();}
+  else{if(err)err.textContent=SB.err||'Erreur inconnue.';if(go){go.disabled=false;go.textContent=up?'Créer mon compte':'Connexion';}}
+}
 
 // ── Données Leçons ──────────────────────────────────────────
 const LESSONS=[
@@ -474,7 +595,7 @@ function rProf(){
   const st=P.st||{};const w=st.wins||0,l=st.losses||0,d=st.draws||0,t=w+l+d,rate=t>0?Math.round(w/t*100):0;
   const av=SHOP.find(s=>s.id===`a${P.avI}`)||SHOP.find(s=>s.cat==='avatar');
   const ti=SHOP.find(s=>s.id===`t${P.tiI}`)||SHOP.find(s=>s.cat==='title');
-  return`<div class="cd cd-g"><div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div class="ap" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'});width:60px;height:60px;font-size:32px">${av?.em||'👑'}</div><div style="flex:1;min-width:0"><div class="fb"><span class="bold lg trunc" style="max-width:180px" id="pname">${P.name}</span><button class="btn btn-d btn-s" onclick="editName()">✏️</button></div><span class="bg2 bg-g mt2">${ti?.nm||'Novice'}</span><div class="xs tm mt2">ELO ${P.elo} · Meilleur ${P.bestElo||P.elo} · 🏆 ${P.trophies.length}/8 trophées</div><div class="pbar mt2"><div class="pfill" style="width:${P.tc%80/80*100}%"></div></div></div></div><div class="fb"><div class="cb">🪙 ${P.coins}</div><button class="btn btn-gn btn-s" onclick="claimD()">🎁 ${P.ld===new Date().toDateString()?'Réclamé':'+25'}</button></div></div><div class="g2"><div class="sbox tc"><div class="slab">⚔️ Parties</div><div class="sval">${t}</div></div><div class="sbox tc"><div class="slab">🏆 V.</div><div class="sval tgn">${w}</div></div><div class="sbox tc"><div class="slab">🤝 N.</div><div class="sval">${d}</div></div><div class="sbox tc"><div class="slab">📈 %V</div><div class="sval tg">${rate}%</div></div></div><div class="g2 mt3"><div class="sbox tc"><div class="slab">🧩 Puzzles</div><div class="sval">${P.totalPuzzlesSolved||PP.length}</div></div><div class="sbox tc"><div class="slab">📖 Leçons</div><div class="sval">${P.totalLessonsDone||PL.length}</div></div><div class="sbox tc"><div class="slab">🔥 Série max</div><div class="sval">${P.bestS||0}</div></div><div class="sbox tc"><div class="slab">⚡ Blitz</div><div class="sval">${P.fastLaunches||0}</div></div></div><div class="cd mt3"><div class="fb mb2"><span class="bold sm">🏆 Succès</span><span class="xs tm">${P.ach.length}/${ACHS.length}</span></div>${ACHS.map(a=>{const u=P.ach.includes(a.id);return`<div class="ach ${u?'u':'l'}"><div class="ach-i">${u?a.ic:'🔒'}</div><div><div class="xs bold">${a.nm}</div><div class="xs tm">${a.ds}</div><div class="xs fm tg">+${a.cn} 🪙</div></div></div>`;}).join('')}</div>`;
+  return`<div class="cd cd-g"><div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div class="ap" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'});width:60px;height:60px;font-size:32px">${av?.em||'👑'}</div><div style="flex:1;min-width:0"><div class="fb"><span class="bold lg trunc" style="max-width:180px" id="pname">${P.name}</span><button class="btn btn-d btn-s" onclick="editName()">✏️</button></div><span class="bg2 bg-g mt2">${ti?.nm||'Novice'}</span></div></div><div class="elo-pair"><div class="elo-box solo"><div class="elo-head"><span>ELO SOLO</span><span class="elo-tag">Contre les IA</span></div><div class="elo-number">${P.elo}</div><div class="elo-caption">Progression contre l'IA</div></div><div class="elo-box world"><div class="elo-head"><span>ELO MONDIAL</span><span class="elo-tag ${SB.profile?'':'offline'}">${SB.profile?'COMPTE LIÉ':'NON CONNECTÉ'}</span></div><div class="elo-number">${SB.profile?SB.profile.world_elo:P.worldElo}</div><div class="elo-caption">${SB.profile?'Classement bientôt disponible':'Bientôt disponible'}</div></div></div><div class="fb mt2"><span class="xs tm">Niveau ${P.tc/80+1|0} · 🏆 ${P.trophies.length}/8 trophées</span><span class="cb">🪙 ${P.coins}</span></div><div class="pbar mt2"><div class="pfill" style="width:${P.tc%80/80*100}%"></div></div><button class="btn btn-gn btn-s btn-f mt2" onclick="claimD()">🎁 ${P.ld===new Date().toDateString()?'Bonus quotidien déjà réclamé':'+25 Couronnes — Bonus quotidien'}</button></div><div class="g2"><div class="sbox tc"><div class="slab">⚔️ Parties IA</div><div class="sval">${t}</div></div><div class="sbox tc"><div class="slab">🏆 Victoires IA</div><div class="sval tgn">${w}</div></div><div class="sbox tc"><div class="slab">🤝 Nulles IA</div><div class="sval">${d}</div></div><div class="sbox tc"><div class="slab">📈 Taux victoire IA</div><div class="sval tg">${rate}%</div></div></div><div class="g2 mt3"><div class="sbox tc"><div class="slab">🧩 Puzzles</div><div class="sval">${P.totalPuzzlesSolved||PP.length}</div></div><div class="sbox tc"><div class="slab">📖 Leçons</div><div class="sval">${P.totalLessonsDone||PL.length}</div></div><div class="sbox tc"><div class="slab">🔥 Série max</div><div class="sval">${P.bestS||0}</div></div><div class="sbox tc"><div class="slab">⚡ Blitz</div><div class="sval">${P.fastLaunches||0}</div></div></div>${rAccount()}<div class="cd mt3"><div class="fb mb2"><span class="bold sm">🏆 Succès</span><span class="xs tm">${P.ach.length}/${ACHS.length}</span></div>${ACHS.map(a=>{const u=P.ach.includes(a.id);return`<div class="ach ${u?'u':'l'}"><div class="ach-i">${u?a.ic:'🔒'}</div><div><div class="xs bold">${a.nm}</div><div class="xs tm">${a.ds}</div><div class="xs fm tg">+${a.cn} 🪙</div></div></div>`;}).join('')}</div>`;
 }
 
 // ── Shop ────────────────────────────────────────────────────
@@ -577,6 +698,19 @@ function resign(){if(!G.game||G.game.game_over())return;G.resBy=G.mode==='ai'?G.
 
 function reportR(){
   if(G.rep)return;G.rep=true;
+
+  // Les parties locales ne sont ni classées Solo ni Mondiales.
+  if(G.mode==='local'){
+    P.lg=(P.lg||0)+1;
+    svA();
+    return;
+  }
+
+  // Réservé à une future intégration des parties en ligne.
+  // Aucune statistique ni aucun ELO mondial n'est modifié dans cette version.
+  if(G.mode==='online')return;
+  if(G.mode!=='ai')return;
+
   let res='draw';const c=G.game;
   if(c.in_checkmate())res=c.turn()===G.pColor?'loss':'win';
   else if(G.tOut)res=G.tOut===G.pColor?'win':'loss';
@@ -692,14 +826,14 @@ function showPromo(fr,to){
 
 function editName(){
   const ov=document.createElement('div');ov.className='ov c';
-  ov.innerHTML=`<div class="pr-b" style="padding:20px"><h4 class="font-serif lg mb2" style="font-family:'Cormorant Garamond',serif">Votre Nom</h4><input type="text" id="ni" value="${P.name}" maxlength="28"><button class="btn btn-g btn-f mt3" onclick="P.name=document.getElementById('ni').value.trim()||P.name;svA();this.closest('.ov').remove();render()">Valider</button></div>`;
+  ov.innerHTML=`<div class="pr-b" style="padding:20px"><h4 class="font-serif lg mb2" style="font-family:'Cormorant Garamond',serif">Votre Nom</h4><input type="text" id="ni" value="${P.name}" maxlength="28"><button class="btn btn-g btn-f mt3" onclick="P.name=document.getElementById('ni').value.trim()||P.name;svA();if(SB.user)SB.pushCosmetics();this.closest('.ov').remove();render()">Valider</button></div>`;
   document.body.appendChild(ov);setTimeout(()=>document.getElementById('ni')?.focus(),100);
 }
 
 function claimD(){if(P.ld===new Date().toDateString())return;P.ld=new Date().toDateString();P.coins+=25;P.tc+=25;toast('🎁','Bonus quotidien','+25 🪙 !');checkAch();svA();render();}
 
 function buy(id){const it=SHOP.find(s=>s.id===id);if(!it||P.coins<it.p)return;P.coins-=it.p;P.owned.push(id);vib([8,40,8]);Au.success();toast('🛍️','Article acquis !',it.nm);svA();render();}
-function equip(id){const it=SHOP.find(s=>s.id===id);if(!it)return;const n=+id.slice(1);if(it.cat==='board')P.bt=it.th;else if(it.cat==='piece')P.pt=it.pidx||0;else if(it.cat==='avatar')P.avI=n;else if(it.cat==='title')P.tiI=n;vib();Au.move();svA();render();}
+function equip(id){const it=SHOP.find(s=>s.id===id);if(!it)return;const n=+id.slice(1);if(it.cat==='board')P.bt=it.th;else if(it.cat==='piece')P.pt=it.pidx||0;else if(it.cat==='avatar'){P.avI=n;if(SB.user)SB.pushCosmetics();}else if(it.cat==='title')P.tiI=n;vib();Au.move();svA();render();}
 
 function toast(ic,t,s){const el=document.createElement('div');el.className='tst';el.innerHTML=`<span class="tst-i">${ic}</span><div><div class="tst-t">${t}</div>${s?`<div class="tst-s">${s}</div>`:''}</div>`;const tw=$('#tw');if(tw){tw.appendChild(el);setTimeout(()=>el.remove(),4200);}}
 
@@ -710,4 +844,5 @@ function openHelp(){const ov=document.createElement('div');ov.className='ov c';o
 
 // ── Démarrage ───────────────────────────────────────────────
 checkTrophies();svA();
+SB.init(); // sans effet si SUPABASE_URL / SUPABASE_ANON ne sont pas renseignés
 render();
