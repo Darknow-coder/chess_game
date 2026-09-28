@@ -120,40 +120,45 @@ function svA(){sv('er2_p',P);sv('er2_l',PL);sv('er2_pp',PP);sv('er2_te',TE);sv('
 //  • Aucun matchmaking, aucune partie en ligne, aucun classement.
 //  • L'ELO Solo (P.elo) reste 100 % local et n'est jamais envoyé.
 //  • Le profil Supabase deviendra plus tard la source officielle de l'ELO mondial.
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
 const SB={
   client:null,        // instance supabase-js
   user:null,          // utilisateur connecté (auth.users)
   profile:null,       // ligne de la table `profiles`
   busy:false,         // opération réseau en cours
   err:'',             // dernier message d'erreur à afficher
+  lb:[],              // liste publique du classement mondial
+  lbLoading:false,    // chargement du classement en cours
+  lbLoaded:false,     // classement déjà chargé au moins une fois
+  lbErr:'',           // erreur éventuelle du classement
   configured(){return !!(window.SUPABASE_URL&&window.SUPABASE_ANON&&window.supabase);},
   init(){
     if(!this.configured())return false;
-    try{
-      this.client=window.supabase.createClient(window.SUPABASE_URL,window.SUPABASE_ANON);
-    }catch(e){
-      this.client=null;
-      this.err='Impossible d’initialiser Supabase : '+(e?.message||e);
-      console.warn('Supabase init',e);
-      return false;
-    }
+    try{this.client=window.supabase.createClient(window.SUPABASE_URL,window.SUPABASE_ANON);}
+    catch(e){console.warn('Supabase init',e);return false;}
     // Restaure la session existante puis écoute les changements (connexion/déconnexion).
-    this.client.auth.getSession().then(({data})=>this._onSession(data?.session||null)).catch(e=>{
-      this.err=e?.message||'Impossible de récupérer la session Supabase.';
-      console.warn('Supabase getSession',e);
-      render();
-    });
+    this.client.auth.getSession().then(({data})=>this._onSession(data?.session||null));
     this.client.auth.onAuthStateChange((_ev,session)=>this._onSession(session));
     return true;
-  },
-  ensureClient(){
-    if(this.client)return true;
-    return this.init();
   },
   async _onSession(session){
     this.user=session?.user||null;
     this.profile=null;
-    if(this.user){await this.ensureProfile();}
+    if(this.user){
+      await this.ensureProfile();
+      if(this.profile){
+        if(typeof this.profile.world_elo==='number')P.worldElo=this.profile.world_elo;
+        P.worldStats={
+          wins:this.profile.world_wins||0,
+          losses:this.profile.world_losses||0,
+          draws:this.profile.world_draws||0,
+          games:this.profile.world_games||0
+        };
+        svA();
+      }
+    }
+    if(G.tab==='world'||this.lbLoaded){this.fetchLeaderboard();}
     render();
   },
   // Crée le profil s'il n'existe pas encore, puis le charge.
@@ -173,13 +178,40 @@ const SB={
     const {error}=await this.client.from('profiles').update({username:P.name,avatar_idx:P.avI||0}).eq('id',this.user.id);
     if(error){console.warn('profiles update',error);return;}
     if(this.profile){this.profile.username=P.name;this.profile.avatar_idx=P.avI||0;}
+    if(this.lbLoaded)this.fetchLeaderboard();
+  },
+  // Récupère le classement mondial par world_elo décroissant (lecture seule).
+  async fetchLeaderboard(limit=100){
+    if(!this.configured()){this.lbErr='Supabase non configuré.';render();return[];}
+    if(!this.client){this.init();}
+    if(!this.client){this.lbErr='Client Supabase indisponible.';render();return[];}
+    this.lbLoading=true;this.lbErr='';render();
+    try{
+      const {data,error}=await this.client
+        .from('profiles')
+        .select('id,username,avatar_idx,world_elo,world_wins,world_losses,world_draws,world_games')
+        .order('world_elo',{ascending:false})
+        .order('world_wins',{ascending:false})
+        .order('created_at',{ascending:true})
+        .limit(limit);
+      this.lbLoading=false;
+      if(error){
+        console.warn('leaderboard select',error);
+        this.lbErr=error.message||'Impossible de récupérer le classement.';
+        render();return[];
+      }
+      this.lb=Array.isArray(data)?data:[];
+      this.lbLoaded=true;
+      render();
+      return this.lb;
+    }catch(e){
+      this.lbLoading=false;
+      this.lbErr=(e&&e.message)||'Erreur réseau lors du chargement.';
+      render();
+      return[];
+    }
   },
   async signUp(email,pass,username){
-    if(!this.ensureClient()){
-      if(!this.err)this.err='Supabase n’est pas correctement configuré dans index.html.';
-      render();
-      return false;
-    }
     this.busy=true;this.err='';render();
     const {data,error}=await this.client.auth.signUp({email,password:pass,options:{data:{username}}});
     this.busy=false;
@@ -190,11 +222,6 @@ const SB={
     toast('✅','Compte créé','Bienvenue au Salon !');return true;
   },
   async signIn(email,pass){
-    if(!this.ensureClient()){
-      if(!this.err)this.err='Supabase n’est pas correctement configuré dans index.html.';
-      render();
-      return false;
-    }
     this.busy=true;this.err='';render();
     const {error}=await this.client.auth.signInWithPassword({email,password:pass});
     this.busy=false;
@@ -210,18 +237,20 @@ const SB={
 
 // Bloc "Compte" affiché dans le Profil (design existant : cartes .cd, boutons .btn).
 function rAccount(){
-  if(!SB.configured())return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-r">Non configuré</span></div><div class="inline-note">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour activer la création de compte. L'ELO Solo et le Duel Local fonctionnent sans compte.</div></div>`;
+  if(!SB.configured())return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-r">Non configuré</span></div><div class="inline-note">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour activer la création de compte et le Classement Mondial. L'ELO Solo et le Duel Local fonctionnent sans compte.</div></div>`;
   if(SB.user){
     const pr=SB.profile;
     return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-n">Connecté</span></div>
-    <div class="xs tm">${SB.user.email||''}</div>
+    <div class="xs tm">${esc(SB.user.email||'')}</div>
     ${pr?`<div class="kpi-row mt2"><div class="kpi"><div class="v tg">${pr.world_elo}</div><div class="l">ELO mondial (profil)</div></div><div class="kpi"><div class="v">${pr.world_games}</div><div class="l">Parties classées</div></div><div class="kpi"><div class="v tgn">${pr.world_wins}</div><div class="l">Victoires</div></div></div>`:`<div class="inline-note mt2">Chargement du profil…</div>`}
-    <div class="inline-note mt2">Le classement mondial et les parties en ligne arrivent dans une prochaine étape. Votre ELO Solo reste local.</div>
+    <div class="inline-note mt2">Votre ELO Solo reste local (contre les IA). L'ELO Mondial est dédié au classement en ligne.</div>
+    <button class="btn btn-g btn-f btn-s mt2" onclick="openWorld()">🌍 Voir le Classement Mondial</button>
     <div class="g2 mt2"><button class="btn btn-d btn-s" onclick="SB.pushCosmetics().then(()=>toast('☁️','Profil synchronisé','Pseudo et avatar mis à jour.'))">☁️ Synchroniser pseudo/avatar</button><button class="btn btn-d btn-s" onclick="SB.signOut()">Se déconnecter</button></div></div>`;
   }
   return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-g">Hors ligne</span></div>
-  <div class="inline-note">Créez un compte pour préparer votre ELO mondial (1200 au départ). Vos données locales sont conservées.</div>
-  <div class="g2 mt2"><button class="btn btn-g btn-s" onclick="openAuth('in')">Se connecter</button><button class="btn btn-d btn-s" onclick="openAuth('up')">Créer un compte</button></div></div>`;
+  <div class="inline-note">Créez un compte pour apparaître dans le Classement Mondial (1200 ELO au départ). Vos données locales sont conservées.</div>
+  <div class="g2 mt2"><button class="btn btn-g btn-s" onclick="openAuth('in')">Se connecter</button><button class="btn btn-d btn-s" onclick="openAuth('up')">Créer un compte</button></div>
+  <button class="btn btn-d btn-f btn-s mt2" onclick="openWorld()">🌍 Consulter le Classement Mondial</button></div>`;
 }
 
 // Feuille d'authentification (email + mot de passe), réutilise .ov / .pr-b existants.
@@ -425,9 +454,80 @@ function setTC(t,inc){G.tLim=t;G.tInc=inc;G.wTime=t;G.bTime=t;P.fastLaunches=(P.
 // ── Render principal ────────────────────────────────────────
 function render(){
   const a=$('#app');
-  a.innerHTML=renderHD()+`<div class="mn"><div class="pg" id="pg-menu">${rMenu()}</div><div class="pg h" id="pg-play">${rPlay()}</div><div class="pg h" id="pg-trophies">${rTrophies()}</div><div class="pg h" id="pg-academy">${rAcad()}</div><div class="pg h" id="pg-profile">${rProf()}</div><div class="pg h" id="pg-shop">${rShop()}</div></div>`+renderTB()+`<div class="tw" id="tw"></div>`+(G.showTut?rTut():'');
+  a.innerHTML=renderHD()+`<div class="mn"><div class="pg" id="pg-menu">${rMenu()}</div><div class="pg h" id="pg-play">${rPlay()}</div><div class="pg h" id="pg-trophies">${rTrophies()}</div><div class="pg h" id="pg-world">${rWorld()}</div><div class="pg h" id="pg-academy">${rAcad()}</div><div class="pg h" id="pg-profile">${rProf()}</div><div class="pg h" id="pg-shop">${rShop()}</div></div>`+renderTB()+`<div class="tw" id="tw"></div>`+(G.showTut?rTut():'');
   $$('.pg').forEach(p=>p.classList.add('h'));
   const pg=$(`#pg-${G.tab}`);if(pg)pg.classList.remove('h');
+}
+
+function openWorld(){
+  G.tab='world';
+  render();
+  if(SB.configured()&&!SB.lbLoading)SB.fetchLeaderboard();
+}
+
+// ── Classement Mondial (Supabase — lecture publique world_elo) ──
+function rWorld(){
+  const rows=SB.lb||[];
+  const myId=SB.user?SB.user.id:null;
+  const myRank=myId?rows.findIndex(r=>r.id===myId)+1:0;
+  const myElo=SB.profile?SB.profile.world_elo:P.worldElo;
+  const myGames=SB.profile?SB.profile.world_games:(P.worldStats?.games||0);
+  const myAv=SHOP.find(s=>s.id===`a${SB.profile?SB.profile.avatar_idx:P.avI}`)||SHOP.find(s=>s.cat==='avatar');
+
+  let body='';
+  if(!SB.configured()){
+    body=`<div class="cd"><div class="ebx e"><div class="ebt tr">🌐 Supabase non configuré</div><div class="ebb">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour afficher le classement mondial en direct.</div></div></div>`;
+  }else if(SB.lbLoading&&!rows.length){
+    body=`<div class="cd empty-state">⏳ Chargement du classement mondial...</div>`;
+  }else if(SB.lbErr){
+    body=`<div class="cd"><div class="ebx e"><div class="ebt tr">⚠️ Impossible de charger le classement</div><div class="ebb">${esc(SB.lbErr)}</div></div><button class="btn btn-g btn-f" onclick="SB.fetchLeaderboard()">🔄 Réessayer</button></div>`;
+  }else if(!rows.length){
+    body=`<div class="cd empty-state">Aucun joueur classé pour le moment.<br>Créez un compte dans l'onglet Profil pour inaugurer le Classement Mondial !</div>`;
+  }else{
+    body=`<div class="lb-list">${rows.map((r,idx)=>{
+      const pos=idx+1;
+      const isMe=!!(myId&&r.id===myId);
+      const av=SHOP.find(s=>s.id===`a${r.avatar_idx||0}`)||SHOP.find(s=>s.cat==='avatar');
+      const topCls=pos===1?'top1':pos===2?'top2':pos===3?'top3':'';
+      const medal=pos===1?'🥇':pos===2?'🥈':pos===3?'🥉':'';
+      const gms=r.world_games||0;
+      const w=r.world_wins||0,d=r.world_draws||0,l=r.world_losses||0;
+      return`<div class="lb-row ${topCls} ${isMe?'me':''}">
+        <div class="lb-rank">${medal?`<span>${medal}</span>`:''}<span>#${pos}</span></div>
+        <div class="lb-av" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'})">${av?.em||'👑'}</div>
+        <div class="lb-info">
+          <div class="lb-name"><span class="trunc">${esc(r.username||'Joueur')}</span>${isMe?'<span class="bg2 bg-g">VOUS</span>':''}</div>
+          <div class="lb-sub">${gms} partie${gms>1?'s':''} classée${gms>1?'s':''} · ${w}V ${d}N ${l}D</div>
+        </div>
+        <div class="lb-right">
+          <div class="lb-elo">${r.world_elo??1200}</div>
+          <div class="lb-games">ELO Mondial</div>
+        </div>
+      </div>`;
+    }).join('')}</div>`;
+  }
+
+  const meBanner=SB.user?`<div class="cd lb-me-banner">
+    <div class="fb">
+      <div style="display:flex;align-items:center;gap:10px;min-width:0">
+        <div class="lb-av" style="background:linear-gradient(135deg,${myAv?.bg||'#D4AF37'},${myAv?.bg2||myAv?.bg||'#8A6D1B'})">${myAv?.em||'👑'}</div>
+        <div style="min-width:0">
+          <div class="xs tg bold">VOTRE RANG MONDIAL</div>
+          <div class="sm bold trunc">${esc(SB.profile?.username||P.name)}</div>
+          <div class="xs tm">${myGames} partie${myGames>1?'s':''} classée${myGames>1?'s':''}</div>
+        </div>
+      </div>
+      <div style="text-align:right">
+        <div class="fm xl bold tg">${myRank>0?'#'+myRank:'—'}</div>
+        <div class="xs tm">${myElo} ELO</div>
+      </div>
+    </div>
+  </div>`:(SB.configured()?`<div class="cd"><div class="fb"><div><div class="sm bold">Rejoignez le Classement Mondial</div><div class="xs tm">Connectez-vous ou créez un compte (1200 ELO au départ).</div></div><button class="btn btn-g btn-s" onclick="G.tab='profile';render()">Mon Compte</button></div></div>`:'');
+
+  return`<div class="cd cd-g"><div class="fb"><div><h2 class="cd-t">🌍 Classement Mondial</h2><div class="xs tm">Joueurs classés par ELO Mondial officiel</div></div><button class="btn btn-d btn-s ${SB.lbLoading?'off':''}" onclick="SB.fetchLeaderboard()">🔄 ${SB.lbLoading?'...':'Actualiser'}</button></div></div>
+  ${meBanner}
+  ${body}
+  <div class="cd mt3"><div class="inline-note">🛡️ <strong>Séparation stricte des ELO :</strong> ce classement affiche uniquement l'<strong>ELO Mondial</strong> (départ à 1200). Votre <strong>ELO Solo</strong> contre les IA (${P.elo} ELO) reste strictement local et n'est jamais envoyé ici.</div></div>`;
 }
 
 // ── Route des Trophées ─────────────────────────────────────
@@ -462,7 +562,7 @@ function rTrophies(){
 
 // ── Header & Tab Bar ────────────────────────────────────────
 function renderHD(){return`<div class="hd"><div class="lg"><div class="li2">♔</div><div class="lt">L'Échiquier Royal</div></div><div class="ac"><button class="cb" onclick="G.tab='shop';render()">🪙 ${P.coins}</button><button class="ib" onclick="Au.on=!Au.on;render()">${Au.on?'🔊':'🔇'}</button></div></div>`;}
-function renderTB(){const tabs=[{id:'menu',ic:'🏠',lb:'Salon'},{id:'play',ic:'⚔️',lb:'Jouer'},{id:'trophies',ic:'🏆',lb:'Trophées'},{id:'academy',ic:'🎓',lb:'Académie'},{id:'shop',ic:'🛍️',lb:'Boutique'},{id:'profile',ic:'👤',lb:'Profil'}];return`<div class="tb"><div class="in">${tabs.map(t=>`<button class="tbtn ${G.tab===t.id?'a':''}" onclick="G.tab='${t.id}';render()"><div class="ic">${t.ic}</div><div class="lb">${t.lb}</div></button>`).join('')}</div></div>`;}
+function renderTB(){const tabs=[{id:'menu',ic:'🏠',lb:'Salon'},{id:'play',ic:'⚔️',lb:'Jouer'},{id:'trophies',ic:'🏆',lb:'Trophées'},{id:'world',ic:'🌍',lb:'Mondial'},{id:'academy',ic:'🎓',lb:'Académie'},{id:'shop',ic:'🛍️',lb:'Boutique'},{id:'profile',ic:'👤',lb:'Profil'}];return`<div class="tb"><div class="in">${tabs.map(t=>`<button class="tbtn ${G.tab===t.id?'a':''}" onclick="${t.id==='world'?'openWorld()':`G.tab='${t.id}';render()`}"><div class="ic">${t.ic}</div><div class="lb">${t.lb}</div></button>`).join('')}</div></div>`;}
 
 // ── Menu ────────────────────────────────────────────────────
 function rMenu(){
@@ -515,12 +615,13 @@ function rMenu(){
     </div>
     <div class="subtle-divider"></div>
     <div class="mini-grid">
+      <button class="btn btn-d btn-s" onclick="openWorld()">🌍 Mondial</button>
       <button class="btn btn-d btn-s" onclick="G.tab='trophies';render()">🏆 Trophées</button>
       <button class="btn btn-d btn-s" onclick="G.tab='profile';render()">👤 Profil</button>
       <button class="btn btn-d btn-s" onclick="G.tab='shop';render()">🛍️ Boutique</button>
       <button class="btn btn-d btn-s" onclick="claimD()">🎁 Bonus</button>
+      <button class="btn btn-d btn-s" onclick="openHelp()">❓ Aide</button>
     </div>
-    <button class="btn btn-d btn-f mt3" onclick="openHelp()">❓ Comment jouer</button>
   </div>
 
   <div class="cd">
@@ -619,7 +720,7 @@ function rProf(){
   const st=P.st||{};const w=st.wins||0,l=st.losses||0,d=st.draws||0,t=w+l+d,rate=t>0?Math.round(w/t*100):0;
   const av=SHOP.find(s=>s.id===`a${P.avI}`)||SHOP.find(s=>s.cat==='avatar');
   const ti=SHOP.find(s=>s.id===`t${P.tiI}`)||SHOP.find(s=>s.cat==='title');
-  return`<div class="cd cd-g"><div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div class="ap" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'});width:60px;height:60px;font-size:32px">${av?.em||'👑'}</div><div style="flex:1;min-width:0"><div class="fb"><span class="bold lg trunc" style="max-width:180px" id="pname">${P.name}</span><button class="btn btn-d btn-s" onclick="editName()">✏️</button></div><span class="bg2 bg-g mt2">${ti?.nm||'Novice'}</span></div></div><div class="elo-pair"><div class="elo-box solo"><div class="elo-head"><span>ELO SOLO</span><span class="elo-tag">Contre les IA</span></div><div class="elo-number">${P.elo}</div><div class="elo-caption">Progression contre l'IA</div></div><div class="elo-box world"><div class="elo-head"><span>ELO MONDIAL</span><span class="elo-tag ${SB.profile?'':'offline'}">${SB.profile?'COMPTE LIÉ':'NON CONNECTÉ'}</span></div><div class="elo-number">${SB.profile?SB.profile.world_elo:P.worldElo}</div><div class="elo-caption">${SB.profile?'Classement bientôt disponible':'Bientôt disponible'}</div></div></div><div class="fb mt2"><span class="xs tm">Niveau ${P.tc/80+1|0} · 🏆 ${P.trophies.length}/8 trophées</span><span class="cb">🪙 ${P.coins}</span></div><div class="pbar mt2"><div class="pfill" style="width:${P.tc%80/80*100}%"></div></div><button class="btn btn-gn btn-s btn-f mt2" onclick="claimD()">🎁 ${P.ld===new Date().toDateString()?'Bonus quotidien déjà réclamé':'+25 Couronnes — Bonus quotidien'}</button></div><div class="g2"><div class="sbox tc"><div class="slab">⚔️ Parties IA</div><div class="sval">${t}</div></div><div class="sbox tc"><div class="slab">🏆 Victoires IA</div><div class="sval tgn">${w}</div></div><div class="sbox tc"><div class="slab">🤝 Nulles IA</div><div class="sval">${d}</div></div><div class="sbox tc"><div class="slab">📈 Taux victoire IA</div><div class="sval tg">${rate}%</div></div></div><div class="g2 mt3"><div class="sbox tc"><div class="slab">🧩 Puzzles</div><div class="sval">${P.totalPuzzlesSolved||PP.length}</div></div><div class="sbox tc"><div class="slab">📖 Leçons</div><div class="sval">${P.totalLessonsDone||PL.length}</div></div><div class="sbox tc"><div class="slab">🔥 Série max</div><div class="sval">${P.bestS||0}</div></div><div class="sbox tc"><div class="slab">⚡ Blitz</div><div class="sval">${P.fastLaunches||0}</div></div></div>${rAccount()}<div class="cd mt3"><div class="fb mb2"><span class="bold sm">🏆 Succès</span><span class="xs tm">${P.ach.length}/${ACHS.length}</span></div>${ACHS.map(a=>{const u=P.ach.includes(a.id);return`<div class="ach ${u?'u':'l'}"><div class="ach-i">${u?a.ic:'🔒'}</div><div><div class="xs bold">${a.nm}</div><div class="xs tm">${a.ds}</div><div class="xs fm tg">+${a.cn} 🪙</div></div></div>`;}).join('')}</div>`;
+  return`<div class="cd cd-g"><div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div class="ap" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'});width:60px;height:60px;font-size:32px">${av?.em||'👑'}</div><div style="flex:1;min-width:0"><div class="fb"><span class="bold lg trunc" style="max-width:180px" id="pname">${P.name}</span><button class="btn btn-d btn-s" onclick="editName()">✏️</button></div><span class="bg2 bg-g mt2">${ti?.nm||'Novice'}</span></div></div><div class="elo-pair"><div class="elo-box solo"><div class="elo-head"><span>ELO SOLO</span><span class="elo-tag">Contre les IA</span></div><div class="elo-number">${P.elo}</div><div class="elo-caption">Progression contre l'IA</div></div><div class="elo-box world" style="cursor:pointer" onclick="openWorld()"><div class="elo-head"><span>ELO MONDIAL</span><span class="elo-tag ${SB.profile?'':'offline'}">${SB.profile?'COMPTE LIÉ':'NON CONNECTÉ'}</span></div><div class="elo-number">${SB.profile?SB.profile.world_elo:P.worldElo}</div><div class="elo-caption">🌍 Voir le classement →</div></div></div><div class="fb mt2"><span class="xs tm">Niveau ${P.tc/80+1|0} · 🏆 ${P.trophies.length}/8 trophées</span><span class="cb">🪙 ${P.coins}</span></div><div class="pbar mt2"><div class="pfill" style="width:${P.tc%80/80*100}%"></div></div><button class="btn btn-gn btn-s btn-f mt2" onclick="claimD()">🎁 ${P.ld===new Date().toDateString()?'Bonus quotidien déjà réclamé':'+25 Couronnes — Bonus quotidien'}</button></div><div class="g2"><div class="sbox tc"><div class="slab">⚔️ Parties IA</div><div class="sval">${t}</div></div><div class="sbox tc"><div class="slab">🏆 Victoires IA</div><div class="sval tgn">${w}</div></div><div class="sbox tc"><div class="slab">🤝 Nulles IA</div><div class="sval">${d}</div></div><div class="sbox tc"><div class="slab">📈 Taux victoire IA</div><div class="sval tg">${rate}%</div></div></div><div class="g2 mt3"><div class="sbox tc"><div class="slab">🧩 Puzzles</div><div class="sval">${P.totalPuzzlesSolved||PP.length}</div></div><div class="sbox tc"><div class="slab">📖 Leçons</div><div class="sval">${P.totalLessonsDone||PL.length}</div></div><div class="sbox tc"><div class="slab">🔥 Série max</div><div class="sval">${P.bestS||0}</div></div><div class="sbox tc"><div class="slab">⚡ Blitz</div><div class="sval">${P.fastLaunches||0}</div></div></div>${rAccount()}<div class="cd mt3"><div class="fb mb2"><span class="bold sm">🏆 Succès</span><span class="xs tm">${P.ach.length}/${ACHS.length}</span></div>${ACHS.map(a=>{const u=P.ach.includes(a.id);return`<div class="ach ${u?'u':'l'}"><div class="ach-i">${u?a.ic:'🔒'}</div><div><div class="xs bold">${a.nm}</div><div class="xs tm">${a.ds}</div><div class="xs fm tg">+${a.cn} 🪙</div></div></div>`;}).join('')}</div>`;
 }
 
 // ── Shop ────────────────────────────────────────────────────
