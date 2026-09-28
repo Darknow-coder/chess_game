@@ -128,26 +128,27 @@ const SB={
   err:'',             // dernier message d'erreur à afficher
   configured(){return !!(window.SUPABASE_URL&&window.SUPABASE_ANON&&window.supabase);},
   init(){
-    // Évite de recréer plusieurs clients/listeners si une action relance l'initialisation.
-    if(this.client)return true;
-    if(!this.configured()){
-      this.err='Supabase n’est pas configuré : URL, clé publique ou SDK manquant.';
-      return false;
-    }
+    if(!this.configured())return false;
     try{
       this.client=window.supabase.createClient(window.SUPABASE_URL,window.SUPABASE_ANON);
     }catch(e){
       this.client=null;
       this.err='Impossible d’initialiser Supabase : '+(e?.message||e);
-      console.error('Supabase init',e);
+      console.warn('Supabase init',e);
       return false;
     }
     // Restaure la session existante puis écoute les changements (connexion/déconnexion).
-    this.client.auth.getSession()
-      .then(({data})=>this._onSession(data?.session||null))
-      .catch(e=>console.error('Supabase getSession',e));
+    this.client.auth.getSession().then(({data})=>this._onSession(data?.session||null)).catch(e=>{
+      this.err=e?.message||'Impossible de récupérer la session Supabase.';
+      console.warn('Supabase getSession',e);
+      render();
+    });
     this.client.auth.onAuthStateChange((_ev,session)=>this._onSession(session));
     return true;
+  },
+  ensureClient(){
+    if(this.client)return true;
+    return this.init();
   },
   async _onSession(session){
     this.user=session?.user||null;
@@ -174,9 +175,8 @@ const SB={
     if(this.profile){this.profile.username=P.name;this.profile.avatar_idx=P.avI||0;}
   },
   async signUp(email,pass,username){
-    // Sécurité : si le client n'a pas été créé au chargement, on retente ici
-    // au lieu de provoquer une erreur "Cannot read properties of null (reading 'auth')".
-    if(!this.client&&!this.init()){
+    if(!this.ensureClient()){
+      if(!this.err)this.err='Supabase n’est pas correctement configuré dans index.html.';
       render();
       return false;
     }
@@ -190,8 +190,8 @@ const SB={
     toast('✅','Compte créé','Bienvenue au Salon !');return true;
   },
   async signIn(email,pass){
-    // Même protection que pour l'inscription.
-    if(!this.client&&!this.init()){
+    if(!this.ensureClient()){
+      if(!this.err)this.err='Supabase n’est pas correctement configuré dans index.html.';
       render();
       return false;
     }
