@@ -120,18 +120,13 @@ function svA(){sv('er2_p',P);sv('er2_l',PL);sv('er2_pp',PP);sv('er2_te',TE);sv('
 //  • Aucun matchmaking, aucune partie en ligne, aucun classement.
 //  • L'ELO Solo (P.elo) reste 100 % local et n'est jamais envoyé.
 //  • Le profil Supabase deviendra plus tard la source officielle de l'ELO mondial.
-function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-
 const SB={
   client:null,        // instance supabase-js
   user:null,          // utilisateur connecté (auth.users)
   profile:null,       // ligne de la table `profiles`
+  token:null,         // jeton d'accès (nettoyage file d'attente à la fermeture)
   busy:false,         // opération réseau en cours
   err:'',             // dernier message d'erreur à afficher
-  lb:[],              // liste publique du classement mondial
-  lbLoading:false,    // chargement du classement en cours
-  lbLoaded:false,     // classement déjà chargé au moins une fois
-  lbErr:'',           // erreur éventuelle du classement
   configured(){return !!(window.SUPABASE_URL&&window.SUPABASE_ANON&&window.supabase);},
   init(){
     if(!this.configured())return false;
@@ -144,21 +139,9 @@ const SB={
   },
   async _onSession(session){
     this.user=session?.user||null;
+    this.token=session?.access_token||null;
     this.profile=null;
-    if(this.user){
-      await this.ensureProfile();
-      if(this.profile){
-        if(typeof this.profile.world_elo==='number')P.worldElo=this.profile.world_elo;
-        P.worldStats={
-          wins:this.profile.world_wins||0,
-          losses:this.profile.world_losses||0,
-          draws:this.profile.world_draws||0,
-          games:this.profile.world_games||0
-        };
-        svA();
-      }
-    }
-    if(G.tab==='world'||this.lbLoaded){this.fetchLeaderboard();}
+    if(this.user){await this.ensureProfile();await MQ.cleanupAfterReload();}
     render();
   },
   // Crée le profil s'il n'existe pas encore, puis le charge.
@@ -178,38 +161,6 @@ const SB={
     const {error}=await this.client.from('profiles').update({username:P.name,avatar_idx:P.avI||0}).eq('id',this.user.id);
     if(error){console.warn('profiles update',error);return;}
     if(this.profile){this.profile.username=P.name;this.profile.avatar_idx=P.avI||0;}
-    if(this.lbLoaded)this.fetchLeaderboard();
-  },
-  // Récupère le classement mondial par world_elo décroissant (lecture seule).
-  async fetchLeaderboard(limit=100){
-    if(!this.configured()){this.lbErr='Supabase non configuré.';render();return[];}
-    if(!this.client){this.init();}
-    if(!this.client){this.lbErr='Client Supabase indisponible.';render();return[];}
-    this.lbLoading=true;this.lbErr='';render();
-    try{
-      const {data,error}=await this.client
-        .from('profiles')
-        .select('id,username,avatar_idx,world_elo,world_wins,world_losses,world_draws,world_games')
-        .order('world_elo',{ascending:false})
-        .order('world_wins',{ascending:false})
-        .order('created_at',{ascending:true})
-        .limit(limit);
-      this.lbLoading=false;
-      if(error){
-        console.warn('leaderboard select',error);
-        this.lbErr=error.message||'Impossible de récupérer le classement.';
-        render();return[];
-      }
-      this.lb=Array.isArray(data)?data:[];
-      this.lbLoaded=true;
-      render();
-      return this.lb;
-    }catch(e){
-      this.lbLoading=false;
-      this.lbErr=(e&&e.message)||'Erreur réseau lors du chargement.';
-      render();
-      return[];
-    }
   },
   async signUp(email,pass,username){
     this.busy=true;this.err='';render();
@@ -230,27 +181,160 @@ const SB={
   },
   async signOut(){
     if(!this.client)return;
+    try{if(MQ.inQueue)await MQ.leave(true);}catch(e){} // quitte la file AVANT de perdre la session
     await this.client.auth.signOut();
-    this.user=null;this.profile=null;toast('👋','Déconnecté','À bientôt !');render();
+    this.user=null;this.profile=null;this.token=null;toast('👋','Déconnecté','À bientôt !');render();
+  },
+};
+
+// ── Classement mondial (LECTURE SEULE) ───────────────────────
+// Ne lit que les colonnes publiques du classement, triées par world_elo décroissant.
+// Aucune écriture : l'ELO mondial ne peut être modifié que côté serveur (plus tard).
+const LB={
+  rows:[],            // [{id, username, avatar_idx, world_elo, world_games}]
+  loading:false,
+  loaded:false,       // déjà chargé au moins une fois (évite les rechargements intempestifs)
+  err:'',
+  limit:50,
+  myRank:null,        // rang du joueur connecté, si disponible
+  async refresh(){
+    if(!SB.configured()){this.err='Supabase non configuré.';render();return;}
+    if(!SB.client){this.err='Client Supabase indisponible.';render();return;}
+    if(this.loading)return;
+    this.loading=true;this.err='';render();
+    try{
+      // Lecture publique des données de classement uniquement.
+      const {data,error}=await SB.client
+        .from('profiles')
+        .select('id,username,avatar_idx,world_elo,world_wins,world_losses,world_draws,world_games')
+        .order('world_elo',{ascending:false})
+        .limit(this.limit);
+      if(error)throw error;
+      this.rows=Array.isArray(data)?data:[];
+      this.loaded=true;
+      this._computeMyRank();
+    }catch(e){
+      console.warn('classement',e);
+      this.err=e&&e.message?e.message:'Impossible de charger le classement.';
+      this.rows=[];
+      this.loaded=true;
+    }
+    this.loading=false;render();
+  },
+  // Rang du joueur connecté à partir de la liste déjà récupérée (pas de requête supplémentaire).
+  _computeMyRank(){
+    this.myRank=null;
+    if(!SB.user||!this.rows.length)return;
+    const i=this.rows.findIndex(r=>r.id===SB.user.id);
+    if(i>=0)this.myRank=i+1;
+  },
+  // Lance le chargement si l'onglet est ouvert et que les données ne sont pas encore là.
+  ensure(){
+    if(!this.loaded&&!this.loading&&!this.err)this.refresh();
+  },
+};
+
+// ── File d'attente "Partie rapide" (matchmaking, étape 1/3) ──
+// Cette étape NE fait PAS de matchmaking : elle enregistre seulement la
+// recherche du joueur dans `matchmaking_queue` (ou la retire sur annulation).
+// AUCUN ELO n'est modifié ici : ni P.elo, ni P.worldElo, ni les world_*.
+const MQ={
+  inQueue:false,
+  busy:false,
+  err:'',
+  since:0,          // timestamp d'entrée en file (chrono affiché)
+  count:null,       // joueurs actuellement en file (aide au test à 2 comptes)
+  _timer:null,
+  _tick:0,
+  // Rejoint la file avec l'ELO MONDIAL local (jamais P.elo).
+  async join(){
+    if(!SB.client||!SB.user||this.busy||this.inQueue)return;
+    this.busy=true;this.err='';render();
+    try{
+      // upsert : un joueur = une seule entrée (contrainte unique sur player_id).
+      const {error}=await SB.client.from('matchmaking_queue').upsert(
+        {player_id:SB.user.id,world_elo:P.worldElo,joined_at:new Date().toISOString()},
+        {onConflict:'player_id'});
+      if(error)throw error;
+      this.inQueue=true;this.since=Date.now();
+      try{localStorage.setItem('er2_mq','1')}catch(e){}
+      this._startTimer();this._updateCount();
+      toast('⚡','Recherche lancée','En attente d\'un adversaire…');
+    }catch(e){
+      console.warn('matchmaking join',e);
+      this.err=e&&e.message?e.message:'Impossible de rejoindre la file.';
+    }
+    this.busy=false;render();
+  },
+  // Quitte la file (annulation). Ne touche à aucun ELO ni statistique.
+  async leave(silent){
+    this._stopTimer();
+    try{localStorage.removeItem('er2_mq')}catch(e){}
+    const was=this.inQueue;
+    this.inQueue=false;this.since=0;this.count=null;this.err='';
+    if(SB.client&&SB.user&&was){
+      try{await SB.client.from('matchmaking_queue').delete().eq('player_id',SB.user.id);}
+      catch(e){console.warn('matchmaking leave',e);}
+    }
+    if(!silent){toast('🛑','Recherche annulée','Vous avez quitté la file.');render();}
+  },
+  // Nombre de joueurs en file (utile pour tester à 2 comptes).
+  async _updateCount(){
+    if(!SB.client)return;
+    try{
+      const {count,error}=await SB.client.from('matchmaking_queue').select('player_id',{count:'exact',head:true});
+      if(error)throw error;
+      this.count=count;
+      const el=document.getElementById('mq-count');
+      if(el)el.textContent=(count==null?'—':count)+' joueur(s) en file';
+    }catch(e){/* silencieux : le compteur est indicatif */}
+  },
+  _startTimer(){
+    this._stopTimer();this._tick=0;
+    this._timer=setInterval(()=>{
+      this._tick++;
+      const el=document.getElementById('mq-time');
+      if(el&&this.since)el.textContent=fmt(Math.floor((Date.now()-this.since)/1000));
+      if(this._tick%5===0)this._updateCount();
+    },1000);
+  },
+  _stopTimer(){if(this._timer){clearInterval(this._timer);this._timer=null;}},
+  // Nettoyage "fantôme" après rechargement : si le flag local dit qu'on était
+  // en file, c'est que la page a été fermée brutalement → on retire notre entrée.
+  async cleanupAfterReload(){
+    let flag=false;try{flag=localStorage.getItem('er2_mq')==='1'}catch(e){}
+    if(!flag||!SB.client||!SB.user)return;
+    try{await SB.client.from('matchmaking_queue').delete().eq('player_id',SB.user.id);}catch(e){}
+    try{localStorage.removeItem('er2_mq')}catch(e){}
+    this.inQueue=false;
+  },
+  // Tentative de nettoyage à la fermeture de l'onglet (best effort, keepalive).
+  cleanupBeacon(){
+    try{
+      if(!this.inQueue||!SB.user||!SB.token)return;
+      fetch(window.SUPABASE_URL+'/rest/v1/matchmaking_queue?player_id=eq.'+SB.user.id,{
+        method:'DELETE',keepalive:true,
+        headers:{apikey:window.SUPABASE_ANON,Authorization:'Bearer '+SB.token}
+      });
+    }catch(e){}
+    try{localStorage.removeItem('er2_mq')}catch(e){}
   },
 };
 
 // Bloc "Compte" affiché dans le Profil (design existant : cartes .cd, boutons .btn).
 function rAccount(){
-  if(!SB.configured())return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-r">Non configuré</span></div><div class="inline-note">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour activer la création de compte et le Classement Mondial. L'ELO Solo et le Duel Local fonctionnent sans compte.</div></div>`;
+  if(!SB.configured())return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-r">Non configuré</span></div><div class="inline-note">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour activer la création de compte. L'ELO Solo et le Duel Local fonctionnent sans compte.</div></div>`;
   if(SB.user){
     const pr=SB.profile;
     return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-n">Connecté</span></div>
-    <div class="xs tm">${esc(SB.user.email||'')}</div>
+    <div class="xs tm">${SB.user.email||''}</div>
     ${pr?`<div class="kpi-row mt2"><div class="kpi"><div class="v tg">${pr.world_elo}</div><div class="l">ELO mondial (profil)</div></div><div class="kpi"><div class="v">${pr.world_games}</div><div class="l">Parties classées</div></div><div class="kpi"><div class="v tgn">${pr.world_wins}</div><div class="l">Victoires</div></div></div>`:`<div class="inline-note mt2">Chargement du profil…</div>`}
-    <div class="inline-note mt2">Votre ELO Solo reste local (contre les IA). L'ELO Mondial est dédié au classement en ligne.</div>
-    <button class="btn btn-g btn-f btn-s mt2" onclick="openWorld()">🌍 Voir le Classement Mondial</button>
+    <div class="inline-note mt2">Les parties en ligne (matchmaking) arrivent dans une prochaine étape. Votre ELO Solo reste local.</div>
     <div class="g2 mt2"><button class="btn btn-d btn-s" onclick="SB.pushCosmetics().then(()=>toast('☁️','Profil synchronisé','Pseudo et avatar mis à jour.'))">☁️ Synchroniser pseudo/avatar</button><button class="btn btn-d btn-s" onclick="SB.signOut()">Se déconnecter</button></div></div>`;
   }
   return`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Compte en ligne</span><span class="bg2 bg-g">Hors ligne</span></div>
-  <div class="inline-note">Créez un compte pour apparaître dans le Classement Mondial (1200 ELO au départ). Vos données locales sont conservées.</div>
-  <div class="g2 mt2"><button class="btn btn-g btn-s" onclick="openAuth('in')">Se connecter</button><button class="btn btn-d btn-s" onclick="openAuth('up')">Créer un compte</button></div>
-  <button class="btn btn-d btn-f btn-s mt2" onclick="openWorld()">🌍 Consulter le Classement Mondial</button></div>`;
+  <div class="inline-note">Créez un compte pour préparer votre ELO mondial (1200 au départ). Vos données locales sont conservées.</div>
+  <div class="g2 mt2"><button class="btn btn-g btn-s" onclick="openAuth('in')">Se connecter</button><button class="btn btn-d btn-s" onclick="openAuth('up')">Créer un compte</button></div></div>`;
 }
 
 // Feuille d'authentification (email + mot de passe), réutilise .ov / .pr-b existants.
@@ -408,12 +492,14 @@ const G={
   wTime:600, bTime:600, tLim:600, tInc:0, tOut:null, resBy:null, rep:false,
   lsnMode:null, lsnIdx:0, lsnFen:'', lsnSt:'wait', lsnFb:'',
   pzMode:null, pzIdx:0, pzFen:'', pzSt:'solving', pzHint:false, pzSel:null,
-  shopCat:'board', showTut:!tutS,
+  shopCat:'board', showTut:!tutS, onlineView:false,
 };
 
 // ── Helpers ─────────────────────────────────────────────────
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 function fmt(s){return String(s/60|0).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
+// Échappement HTML pour tout contenu provenant de la base (pseudos Supabase).
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 function opening(){
   const h=G.hist.map(m=>m.san).join(' ');
   if(!h)return 'Position Initiale';
@@ -454,80 +540,11 @@ function setTC(t,inc){G.tLim=t;G.tInc=inc;G.wTime=t;G.bTime=t;P.fastLaunches=(P.
 // ── Render principal ────────────────────────────────────────
 function render(){
   const a=$('#app');
-  a.innerHTML=renderHD()+`<div class="mn"><div class="pg" id="pg-menu">${rMenu()}</div><div class="pg h" id="pg-play">${rPlay()}</div><div class="pg h" id="pg-trophies">${rTrophies()}</div><div class="pg h" id="pg-world">${rWorld()}</div><div class="pg h" id="pg-academy">${rAcad()}</div><div class="pg h" id="pg-profile">${rProf()}</div><div class="pg h" id="pg-shop">${rShop()}</div></div>`+renderTB()+`<div class="tw" id="tw"></div>`+(G.showTut?rTut():'');
+  a.innerHTML=renderHD()+`<div class="mn"><div class="pg" id="pg-menu">${rMenu()}</div><div class="pg h" id="pg-play">${rPlay()}</div><div class="pg h" id="pg-rankings">${rRankings()}</div><div class="pg h" id="pg-trophies">${rTrophies()}</div><div class="pg h" id="pg-academy">${rAcad()}</div><div class="pg h" id="pg-profile">${rProf()}</div><div class="pg h" id="pg-shop">${rShop()}</div></div>`+renderTB()+`<div class="tw" id="tw"></div>`+(G.showTut?rTut():'');
   $$('.pg').forEach(p=>p.classList.add('h'));
   const pg=$(`#pg-${G.tab}`);if(pg)pg.classList.remove('h');
-}
-
-function openWorld(){
-  G.tab='world';
-  render();
-  if(SB.configured()&&!SB.lbLoading)SB.fetchLeaderboard();
-}
-
-// ── Classement Mondial (Supabase — lecture publique world_elo) ──
-function rWorld(){
-  const rows=SB.lb||[];
-  const myId=SB.user?SB.user.id:null;
-  const myRank=myId?rows.findIndex(r=>r.id===myId)+1:0;
-  const myElo=SB.profile?SB.profile.world_elo:P.worldElo;
-  const myGames=SB.profile?SB.profile.world_games:(P.worldStats?.games||0);
-  const myAv=SHOP.find(s=>s.id===`a${SB.profile?SB.profile.avatar_idx:P.avI}`)||SHOP.find(s=>s.cat==='avatar');
-
-  let body='';
-  if(!SB.configured()){
-    body=`<div class="cd"><div class="ebx e"><div class="ebt tr">🌐 Supabase non configuré</div><div class="ebb">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour afficher le classement mondial en direct.</div></div></div>`;
-  }else if(SB.lbLoading&&!rows.length){
-    body=`<div class="cd empty-state">⏳ Chargement du classement mondial...</div>`;
-  }else if(SB.lbErr){
-    body=`<div class="cd"><div class="ebx e"><div class="ebt tr">⚠️ Impossible de charger le classement</div><div class="ebb">${esc(SB.lbErr)}</div></div><button class="btn btn-g btn-f" onclick="SB.fetchLeaderboard()">🔄 Réessayer</button></div>`;
-  }else if(!rows.length){
-    body=`<div class="cd empty-state">Aucun joueur classé pour le moment.<br>Créez un compte dans l'onglet Profil pour inaugurer le Classement Mondial !</div>`;
-  }else{
-    body=`<div class="lb-list">${rows.map((r,idx)=>{
-      const pos=idx+1;
-      const isMe=!!(myId&&r.id===myId);
-      const av=SHOP.find(s=>s.id===`a${r.avatar_idx||0}`)||SHOP.find(s=>s.cat==='avatar');
-      const topCls=pos===1?'top1':pos===2?'top2':pos===3?'top3':'';
-      const medal=pos===1?'🥇':pos===2?'🥈':pos===3?'🥉':'';
-      const gms=r.world_games||0;
-      const w=r.world_wins||0,d=r.world_draws||0,l=r.world_losses||0;
-      return`<div class="lb-row ${topCls} ${isMe?'me':''}">
-        <div class="lb-rank">${medal?`<span>${medal}</span>`:''}<span>#${pos}</span></div>
-        <div class="lb-av" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'})">${av?.em||'👑'}</div>
-        <div class="lb-info">
-          <div class="lb-name"><span class="trunc">${esc(r.username||'Joueur')}</span>${isMe?'<span class="bg2 bg-g">VOUS</span>':''}</div>
-          <div class="lb-sub">${gms} partie${gms>1?'s':''} classée${gms>1?'s':''} · ${w}V ${d}N ${l}D</div>
-        </div>
-        <div class="lb-right">
-          <div class="lb-elo">${r.world_elo??1200}</div>
-          <div class="lb-games">ELO Mondial</div>
-        </div>
-      </div>`;
-    }).join('')}</div>`;
-  }
-
-  const meBanner=SB.user?`<div class="cd lb-me-banner">
-    <div class="fb">
-      <div style="display:flex;align-items:center;gap:10px;min-width:0">
-        <div class="lb-av" style="background:linear-gradient(135deg,${myAv?.bg||'#D4AF37'},${myAv?.bg2||myAv?.bg||'#8A6D1B'})">${myAv?.em||'👑'}</div>
-        <div style="min-width:0">
-          <div class="xs tg bold">VOTRE RANG MONDIAL</div>
-          <div class="sm bold trunc">${esc(SB.profile?.username||P.name)}</div>
-          <div class="xs tm">${myGames} partie${myGames>1?'s':''} classée${myGames>1?'s':''}</div>
-        </div>
-      </div>
-      <div style="text-align:right">
-        <div class="fm xl bold tg">${myRank>0?'#'+myRank:'—'}</div>
-        <div class="xs tm">${myElo} ELO</div>
-      </div>
-    </div>
-  </div>`:(SB.configured()?`<div class="cd"><div class="fb"><div><div class="sm bold">Rejoignez le Classement Mondial</div><div class="xs tm">Connectez-vous ou créez un compte (1200 ELO au départ).</div></div><button class="btn btn-g btn-s" onclick="G.tab='profile';render()">Mon Compte</button></div></div>`:'');
-
-  return`<div class="cd cd-g"><div class="fb"><div><h2 class="cd-t">🌍 Classement Mondial</h2><div class="xs tm">Joueurs classés par ELO Mondial officiel</div></div><button class="btn btn-d btn-s ${SB.lbLoading?'off':''}" onclick="SB.fetchLeaderboard()">🔄 ${SB.lbLoading?'...':'Actualiser'}</button></div></div>
-  ${meBanner}
-  ${body}
-  <div class="cd mt3"><div class="inline-note">🛡️ <strong>Séparation stricte des ELO :</strong> ce classement affiche uniquement l'<strong>ELO Mondial</strong> (départ à 1200). Votre <strong>ELO Solo</strong> contre les IA (${P.elo} ELO) reste strictement local et n'est jamais envoyé ici.</div></div>`;
+  // Charge le classement à la première ouverture de l'onglet (asynchrone, sans boucle).
+  if(G.tab==='rankings')setTimeout(()=>LB.ensure(),0);
 }
 
 // ── Route des Trophées ─────────────────────────────────────
@@ -560,9 +577,34 @@ function rTrophies(){
   <button class="btn btn-g btn-f mt3" onclick="showDP()">⚔️ Gagner de l'ELO</button></div>`;
 }
 
+// ── Classement mondial ──────────────────────────────────────
+function rRankings(){
+  const head=`<div class="cd cd-g"><div class="fb"><div><h2 class="cd-t">Classement Mondial</h2><div class="xs tm">ELO mondial — futurs matchs classés contre de vrais joueurs</div></div><button class="btn btn-d btn-s" onclick="LB.refresh()" ${LB.loading?'disabled':''}>${LB.loading?'…':'⟳ Actualiser'}</button></div></div>`;
+  if(!SB.configured())return head+`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Service en ligne</span><span class="bg2 bg-r">Non configuré</span></div><div class="inline-note">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour afficher le classement mondial. Votre ELO Solo et le Duel Local restent disponibles sans compte.</div></div>`;
+
+  // États de chargement / erreur / vide
+  if(LB.loading&&!LB.rows.length)return head+`<div class="cd"><div class="fb"><span class="bold sm">🌍 Chargement du classement…</span><span class="bg2 bg-g">Synchronisation</span></div><div class="kpi-row mt2"><div class="kpi"><div class="v tm">…</div><div class="l">Joueurs</div></div><div class="kpi"><div class="v tm">…</div><div class="l">Meilleur ELO</div></div><div class="kpi"><div class="v tm">…</div><div class="l">Votre rang</div></div></div></div>`;
+  if(LB.err&&!LB.rows.length)return head+`<div class="cd"><div class="fb mb2"><span class="bold sm">⚠️ Erreur de chargement</span><span class="bg2 bg-r">Réseau</span></div><div class="inline-note">${esc(LB.err)}</div><button class="btn btn-g btn-f mt2" onclick="LB.refresh()">Réessayer</button></div>`;
+  if(!LB.rows.length)return head+`<div class="cd"><div class="fb mb2"><span class="bold sm">🌍 Classement</span><span class="bg2 bg-g">Vide</span></div><div class="inline-note">Aucun joueur classé pour le moment. Créez un compte et jouez des parties classées pour apparaître ici !</div></div>`;
+
+  const best=LB.rows[0]?LB.rows[0].world_elo:0;
+  const me=SB.user?LB.rows.find(r=>r.id===SB.user.id):null;
+  const medals=['🥇','🥈','🥉'];
+
+  return head+
+  `<div class="cd"><div class="kpi-row"><div class="kpi"><div class="v tg">${LB.rows.length}</div><div class="l">Joueurs classés</div></div><div class="kpi"><div class="v">${best}</div><div class="l">Meilleur ELO</div></div><div class="kpi"><div class="v ${LB.myRank?'tgn':'tm'}">${LB.myRank?'#'+LB.myRank:'—'}</div><div class="l">Votre rang</div></div></div></div>`+
+  (SB.user&&me?`<div class="cd cd-g"><div class="fb"><span class="bold sm">🎯 Votre position</span><span class="bg2 bg-g">Vous</span></div><div class="lb-row me"><div class="lb-pos">${LB.myRank?medals[LB.myRank-1]||'#'+LB.myRank:'—'}</div><div class="lb-av" style="background:linear-gradient(135deg,${(SHOP.find(s=>s.id==='a'+me.avatar_idx)||SHOP.find(s=>s.cat==='avatar')).bg||'#D4AF37'},${(SHOP.find(s=>s.id==='a'+me.avatar_idx)||SHOP.find(s=>s.cat==='avatar')).bg2||'#8A6D1B'})">${(SHOP.find(s=>s.id==='a'+me.avatar_idx)||SHOP.find(s=>s.cat==='avatar')).em||'👑'}</div><div class="lb-info"><div class="lb-name">${esc(me.username)} <span class="bg2 bg-g" style="margin-left:4px">Vous</span></div><div class="lb-sub">${me.world_games} partie(s) classée(s)</div></div><div class="lb-right"><div class="lb-elo">${me.world_elo}</div><div class="lb-sub">ELO</div></div></div></div>`:'')+
+  `<div class="cd"><div class="fb mb2"><span class="bold sm">🌍 Top Mondial</span><span class="xs tm">${LB.rows.length} joueur(s)</span></div>`+
+  LB.rows.map((r,i)=>{
+    const av=SHOP.find(s=>s.id==='a'+(r.avatar_idx||0))||SHOP.find(s=>s.cat==='avatar');
+    const mine=SB.user&&r.id===SB.user.id;
+    return`<div class="lb-row ${mine?'me':''}"><div class="lb-pos">${i<3?medals[i]:'#'+(i+1)}</div><div class="lb-av" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'})">${av?.em||'👑'}</div><div class="lb-info"><div class="lb-name">${esc(r.username)||'Joueur'}${mine?' <span class="bg2 bg-g" style="margin-left:4px">Vous</span>':''}</div><div class="lb-sub">${r.world_games||0} partie(s) classée(s)</div></div><div class="lb-right"><div class="lb-elo">${r.world_elo}</div><div class="lb-sub">ELO</div></div></div>`;}).join('')+
+  `</div><div class="cd"><div class="inline-note">🔒 Le classement affiche uniquement l'ELO mondial des joueurs. L'ELO Solo (contre l'IA) n'apparaît jamais ici. Les futures parties classées modifieront l'ELO mondial de façon sécurisée côté serveur.</div></div>`;
+}
+
 // ── Header & Tab Bar ────────────────────────────────────────
 function renderHD(){return`<div class="hd"><div class="lg"><div class="li2">♔</div><div class="lt">L'Échiquier Royal</div></div><div class="ac"><button class="cb" onclick="G.tab='shop';render()">🪙 ${P.coins}</button><button class="ib" onclick="Au.on=!Au.on;render()">${Au.on?'🔊':'🔇'}</button></div></div>`;}
-function renderTB(){const tabs=[{id:'menu',ic:'🏠',lb:'Salon'},{id:'play',ic:'⚔️',lb:'Jouer'},{id:'trophies',ic:'🏆',lb:'Trophées'},{id:'world',ic:'🌍',lb:'Mondial'},{id:'academy',ic:'🎓',lb:'Académie'},{id:'shop',ic:'🛍️',lb:'Boutique'},{id:'profile',ic:'👤',lb:'Profil'}];return`<div class="tb"><div class="in">${tabs.map(t=>`<button class="tbtn ${G.tab===t.id?'a':''}" onclick="${t.id==='world'?'openWorld()':`G.tab='${t.id}';render()`}"><div class="ic">${t.ic}</div><div class="lb">${t.lb}</div></button>`).join('')}</div></div>`;}
+function renderTB(){const tabs=[{id:'menu',ic:'🏠',lb:'Salon'},{id:'play',ic:'⚔️',lb:'Jouer'},{id:'rankings',ic:'🌍',lb:'Classement'},{id:'trophies',ic:'🏆',lb:'Trophées'},{id:'academy',ic:'🎓',lb:'Académie'},{id:'shop',ic:'🛍️',lb:'Boutique'},{id:'profile',ic:'👤',lb:'Profil'}];return`<div class="tb"><div class="in">${tabs.map(t=>`<button class="tbtn ${G.tab===t.id?'a':''}" onclick="G.tab='${t.id}';render()"><div class="ic">${t.ic}</div><div class="lb">${t.lb}</div></button>`).join('')}</div></div>`;}
 
 // ── Menu ────────────────────────────────────────────────────
 function rMenu(){
@@ -615,13 +657,12 @@ function rMenu(){
     </div>
     <div class="subtle-divider"></div>
     <div class="mini-grid">
-      <button class="btn btn-d btn-s" onclick="openWorld()">🌍 Mondial</button>
       <button class="btn btn-d btn-s" onclick="G.tab='trophies';render()">🏆 Trophées</button>
       <button class="btn btn-d btn-s" onclick="G.tab='profile';render()">👤 Profil</button>
       <button class="btn btn-d btn-s" onclick="G.tab='shop';render()">🛍️ Boutique</button>
       <button class="btn btn-d btn-s" onclick="claimD()">🎁 Bonus</button>
-      <button class="btn btn-d btn-s" onclick="openHelp()">❓ Aide</button>
     </div>
+    <button class="btn btn-d btn-f mt3" onclick="openHelp()">❓ Comment jouer</button>
   </div>
 
   <div class="cd">
@@ -639,9 +680,30 @@ function rMenu(){
   </div>`;
 }
 
+// ── Partie rapide en ligne — file d'attente (étape 1, pas de matchmaking) ──
+function rOnline(){
+  const back=`<button class="xs tm" onclick="G.onlineView=false;render()">← Retour</button>`;
+  const head=`<div class="cd cd-g mt2"><div class="fb"><div><h2 class="cd-t">⚡ Partie Rapide</h2><div class="xs tm">Matchs classés contre de vrais joueurs</div></div><span class="bg2 bg-g">En ligne</span></div></div>`;
+  if(!SB.configured())return back+head+`<div class="cd"><div class="fb mb2"><span class="bold sm">🌐 Service en ligne</span><span class="bg2 bg-r">Non configuré</span></div><div class="inline-note">Renseignez <code>SUPABASE_URL</code> et <code>SUPABASE_ANON</code> dans <code>index.html</code> pour activer la file d'attente. Votre ELO Solo et le Duel Local restent disponibles sans compte.</div></div>`;
+  if(!SB.user)return back+head+`<div class="cd"><div class="fb mb2"><span class="bold sm">🔐 Compte requis</span><span class="bg2 bg-g">Hors ligne</span></div><div class="inline-note">Connectez-vous pour rejoindre la file d'attente. Votre ELO mondial de départ est de 1200.</div><div class="g2 mt2"><button class="btn btn-g btn-s" onclick="G.tab='profile';G.onlineView=false;render()">Aller au Profil</button><button class="btn btn-d btn-s" onclick="openAuth('up')">Créer un compte</button></div></div>`;
+
+  const eloCard=`<div class="cd"><div class="fb"><span class="bold sm">🌍 Votre ELO mondial</span><span class="fm lg tg bold">${P.worldElo}</span></div><div class="xs tm mt2">C'est cette valeur qui sera envoyée dans la file. L'ELO Solo (${P.elo}) n'est jamais utilisé en ligne.</div></div>`;
+
+  if(!MQ.inQueue){
+    return back+head+eloCard+
+    (MQ.err?`<div class="cd"><div class="inline-note" style="border-color:rgba(217,83,79,.4);color:var(--red-l)">⚠️ ${esc(MQ.err)}</div></div>`:'')+
+    `<div class="cd tc"><div style="font-size:40px;margin-bottom:8px">⚡</div><h3 class="cd-t">Prêt à affronter le monde ?</h3><p class="xs tm mb3">Rejoignez la file d'attente. Le matchmaking automatique arrive à la prochaine étape.</p><button class="btn btn-g btn-f" onclick="MQ.join()" ${MQ.busy?'disabled':''}>${MQ.busy?'Inscription…':'🔍 Rechercher un adversaire'}</button></div>
+    <div class="cd"><div class="inline-note">💡 Pour tester à 2 comptes : ouvrez le jeu dans deux navigateurs (ou un onglet privé), connectez deux comptes différents, et lancez la recherche des deux côtés. Les deux joueurs doivent apparaître dans la table <code>matchmaking_queue</code> de Supabase.</div></div>`;
+  }
+  return back+head+
+  `<div class="cd cd-g tc mq-search"><div class="mq-pulse">⏳</div><h3 class="cd-t">Recherche d'un adversaire…</h3><div class="xs tm">ELO : <strong class="tg">${P.worldElo}</strong></div><div class="fm mq-timer" id="mq-time">00:00</div><div class="xs tm" id="mq-count">… joueur(s) en file</div><button class="btn btn-r btn-f mt3" onclick="MQ.leave()">Annuler la recherche</button></div>
+  <div class="cd"><div class="inline-note">Votre recherche est enregistrée dans la file. L'attribution d'un adversaire et la création de la partie arrivent à la prochaine étape — aucun ELO ne bouge pour l'instant.</div></div>`;
+}
+
 // ── Play ────────────────────────────────────────────────────
 function rPlay(){
-  if(!G.game)return`<div class="cd cd-g tc" style="padding:40px 20px"><h2 class="cd-t" style="font-size:24px">Prêt à jouer ?</h2><p class="sm tm mt2">Choisissez un mode.</p><button class="btn btn-g btn-f mt3" onclick="showDP()">🤖 Contre l'IA</button><button class="btn btn-d btn-f mt2" onclick="G.mode='local';startG()">👥 Duel Local</button></div>`;
+  if(G.onlineView)return rOnline();
+  if(!G.game)return`<div class="cd cd-g tc" style="padding:40px 20px"><h2 class="cd-t" style="font-size:24px">Prêt à jouer ?</h2><p class="sm tm mt2">Choisissez un mode.</p><button class="btn btn-g btn-f mt3" onclick="showDP()">🤖 Contre l'IA</button><button class="btn btn-d btn-f mt2" onclick="G.mode='local';startG()">👥 Duel Local</button></div><div class="cd mt3"><div class="fb mb2"><span class="bold sm">⚡ Jouer en ligne</span><span class="bg2 bg-g">Nouveau</span></div><div class="xs tm mb2">Partie rapide classée contre de vrais joueurs. Étape 1 : file d'attente.</div><button class="btn btn-g btn-f btn-s" onclick="G.onlineView=true;render()">⚡ Partie rapide</button></div>`;
   const c=G.game,fen=c.fen(),over=c.game_over()||!!G.tOut||!!G.resBy,turn=c.turn();
   const ai=AI[G.aiI],isA=G.mode==='ai';
   const topC=G.orient==='w'?'b':'w',botC=G.orient==='w'?'w':'b';
@@ -720,7 +782,7 @@ function rProf(){
   const st=P.st||{};const w=st.wins||0,l=st.losses||0,d=st.draws||0,t=w+l+d,rate=t>0?Math.round(w/t*100):0;
   const av=SHOP.find(s=>s.id===`a${P.avI}`)||SHOP.find(s=>s.cat==='avatar');
   const ti=SHOP.find(s=>s.id===`t${P.tiI}`)||SHOP.find(s=>s.cat==='title');
-  return`<div class="cd cd-g"><div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div class="ap" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'});width:60px;height:60px;font-size:32px">${av?.em||'👑'}</div><div style="flex:1;min-width:0"><div class="fb"><span class="bold lg trunc" style="max-width:180px" id="pname">${P.name}</span><button class="btn btn-d btn-s" onclick="editName()">✏️</button></div><span class="bg2 bg-g mt2">${ti?.nm||'Novice'}</span></div></div><div class="elo-pair"><div class="elo-box solo"><div class="elo-head"><span>ELO SOLO</span><span class="elo-tag">Contre les IA</span></div><div class="elo-number">${P.elo}</div><div class="elo-caption">Progression contre l'IA</div></div><div class="elo-box world" style="cursor:pointer" onclick="openWorld()"><div class="elo-head"><span>ELO MONDIAL</span><span class="elo-tag ${SB.profile?'':'offline'}">${SB.profile?'COMPTE LIÉ':'NON CONNECTÉ'}</span></div><div class="elo-number">${SB.profile?SB.profile.world_elo:P.worldElo}</div><div class="elo-caption">🌍 Voir le classement →</div></div></div><div class="fb mt2"><span class="xs tm">Niveau ${P.tc/80+1|0} · 🏆 ${P.trophies.length}/8 trophées</span><span class="cb">🪙 ${P.coins}</span></div><div class="pbar mt2"><div class="pfill" style="width:${P.tc%80/80*100}%"></div></div><button class="btn btn-gn btn-s btn-f mt2" onclick="claimD()">🎁 ${P.ld===new Date().toDateString()?'Bonus quotidien déjà réclamé':'+25 Couronnes — Bonus quotidien'}</button></div><div class="g2"><div class="sbox tc"><div class="slab">⚔️ Parties IA</div><div class="sval">${t}</div></div><div class="sbox tc"><div class="slab">🏆 Victoires IA</div><div class="sval tgn">${w}</div></div><div class="sbox tc"><div class="slab">🤝 Nulles IA</div><div class="sval">${d}</div></div><div class="sbox tc"><div class="slab">📈 Taux victoire IA</div><div class="sval tg">${rate}%</div></div></div><div class="g2 mt3"><div class="sbox tc"><div class="slab">🧩 Puzzles</div><div class="sval">${P.totalPuzzlesSolved||PP.length}</div></div><div class="sbox tc"><div class="slab">📖 Leçons</div><div class="sval">${P.totalLessonsDone||PL.length}</div></div><div class="sbox tc"><div class="slab">🔥 Série max</div><div class="sval">${P.bestS||0}</div></div><div class="sbox tc"><div class="slab">⚡ Blitz</div><div class="sval">${P.fastLaunches||0}</div></div></div>${rAccount()}<div class="cd mt3"><div class="fb mb2"><span class="bold sm">🏆 Succès</span><span class="xs tm">${P.ach.length}/${ACHS.length}</span></div>${ACHS.map(a=>{const u=P.ach.includes(a.id);return`<div class="ach ${u?'u':'l'}"><div class="ach-i">${u?a.ic:'🔒'}</div><div><div class="xs bold">${a.nm}</div><div class="xs tm">${a.ds}</div><div class="xs fm tg">+${a.cn} 🪙</div></div></div>`;}).join('')}</div>`;
+  return`<div class="cd cd-g"><div style="display:flex;align-items:center;gap:12px;margin-bottom:12px"><div class="ap" style="background:linear-gradient(135deg,${av?.bg||'#D4AF37'},${av?.bg2||av?.bg||'#8A6D1B'});width:60px;height:60px;font-size:32px">${av?.em||'👑'}</div><div style="flex:1;min-width:0"><div class="fb"><span class="bold lg trunc" style="max-width:180px" id="pname">${P.name}</span><button class="btn btn-d btn-s" onclick="editName()">✏️</button></div><span class="bg2 bg-g mt2">${ti?.nm||'Novice'}</span></div></div><div class="elo-pair"><div class="elo-box solo"><div class="elo-head"><span>ELO SOLO</span><span class="elo-tag">Contre les IA</span></div><div class="elo-number">${P.elo}</div><div class="elo-caption">Progression contre l'IA</div></div><div class="elo-box world"><div class="elo-head"><span>ELO MONDIAL</span><span class="elo-tag ${SB.profile?'':'offline'}">${SB.profile?'COMPTE LIÉ':'NON CONNECTÉ'}</span></div><div class="elo-number">${SB.profile?SB.profile.world_elo:P.worldElo}</div><div class="elo-caption">${SB.profile?'Classé dans le classement mondial':'Rejoignez le classement mondial'}</div><button class="btn btn-d btn-s btn-f mt2" onclick="G.tab='rankings';render()">🌍 Voir le classement mondial</button></div></div><div class="fb mt2"><span class="xs tm">Niveau ${P.tc/80+1|0} · 🏆 ${P.trophies.length}/8 trophées</span><span class="cb">🪙 ${P.coins}</span></div><div class="pbar mt2"><div class="pfill" style="width:${P.tc%80/80*100}%"></div></div><button class="btn btn-gn btn-s btn-f mt2" onclick="claimD()">🎁 ${P.ld===new Date().toDateString()?'Bonus quotidien déjà réclamé':'+25 Couronnes — Bonus quotidien'}</button></div><div class="g2"><div class="sbox tc"><div class="slab">⚔️ Parties IA</div><div class="sval">${t}</div></div><div class="sbox tc"><div class="slab">🏆 Victoires IA</div><div class="sval tgn">${w}</div></div><div class="sbox tc"><div class="slab">🤝 Nulles IA</div><div class="sval">${d}</div></div><div class="sbox tc"><div class="slab">📈 Taux victoire IA</div><div class="sval tg">${rate}%</div></div></div><div class="g2 mt3"><div class="sbox tc"><div class="slab">🧩 Puzzles</div><div class="sval">${P.totalPuzzlesSolved||PP.length}</div></div><div class="sbox tc"><div class="slab">📖 Leçons</div><div class="sval">${P.totalLessonsDone||PL.length}</div></div><div class="sbox tc"><div class="slab">🔥 Série max</div><div class="sval">${P.bestS||0}</div></div><div class="sbox tc"><div class="slab">⚡ Blitz</div><div class="sval">${P.fastLaunches||0}</div></div></div>${rAccount()}<div class="cd mt3"><div class="fb mb2"><span class="bold sm">🏆 Succès</span><span class="xs tm">${P.ach.length}/${ACHS.length}</span></div>${ACHS.map(a=>{const u=P.ach.includes(a.id);return`<div class="ach ${u?'u':'l'}"><div class="ach-i">${u?a.ic:'🔒'}</div><div><div class="xs bold">${a.nm}</div><div class="xs tm">${a.ds}</div><div class="xs fm tg">+${a.cn} 🪙</div></div></div>`;}).join('')}</div>`;
 }
 
 // ── Shop ────────────────────────────────────────────────────
@@ -968,6 +1030,8 @@ function rTut(){return`<div class="ov c" id="tut"><div class="pr-b" style="paddi
 function openHelp(){const ov=document.createElement('div');ov.className='ov c';ov.innerHTML=rTut().replace('id="tut"','id="help"').replace('Bienvenue !','Comment jouer ?').replace("tutS=true;sv('er2_tut',true);document.getElementById('tut').remove();G.showTut=false;","document.getElementById('help').remove();");document.body.appendChild(ov);}
 
 // ── Démarrage ───────────────────────────────────────────────
+// Nettoyage best-effort de la file à la fermeture de l'onglet (anti fantômes).
+window.addEventListener('beforeunload',()=>{try{MQ.cleanupBeacon();}catch(e){}});
 checkTrophies();svA();
 SB.init(); // sans effet si SUPABASE_URL / SUPABASE_ANON ne sont pas renseignés
 render();
